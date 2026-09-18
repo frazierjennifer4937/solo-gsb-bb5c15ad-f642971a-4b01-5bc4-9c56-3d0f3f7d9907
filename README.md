@@ -6,6 +6,12 @@
 
 * 每支管的**当前体积**与各标记物的**混合浓度**；
 * 管内液体的**来源构成与占比**（来自哪些初始样本、各占多少体积 / 百分比）；
+* 可选 `max_volume` 的**管容量约束**：配置后任何时刻管体积不得超过上限。
+  `sequential` 模式在每步实际注入后校验目标管；`time_batch` 模式按批次开始
+  状态汇总同管的吸出 `amount` 与注入 `delivered_amount`，以**批末净体积**
+  统一校验（同管同时收发时与数组顺序无关）。任一管超容则整批不落地，
+  返回 400 并定位到 `transfers[i].delivered_amount`，此前批次结果保留；
+  未配置容量时行为与旧版完全一致；
 * 可选 `delivered_amount` 时的**移液损耗追踪**：吸出量 `amount` 与实际
   入管量 `delivered_amount` 的差额按源管当时浓度、来源比例计入该步 `lost`，
   并累计为结果 `waste`；
@@ -15,8 +21,9 @@
 * 两个口径的守恒量：含 waste 的**系统总量差**（应恒为 0）与仅看管内的
   **管内体积 / 质量变化**（恰好等于累计损耗）。
 
-转移量超出当前可用体积、时间逆序、引用未声明的样本时，返回 **HTTP 400** 和
-定位明确的结构化错误（如 `transfers[2].source`），失败记录同样持久化。
+转移量超出当前可用体积、目标管超出容量上限、时间逆序、引用未声明的样本时，
+返回 **HTTP 400** 和定位明确的结构化错误（如 `transfers[2].source`、
+`transfers[1].delivered_amount`），失败记录同样持久化。
 
 ---
 
@@ -56,7 +63,8 @@ docker compose up --build
 
 如需确认容器内运行的新版本，可查看自动生成的 OpenAPI 文档：
 `http://localhost:8000/openapi.json`（其中 `info.version` 随服务版本更新，
-`SimulationRequest.execution_mode` 与 `StepOut.batch_index` 均已包含在
+`SimulationRequest.execution_mode`、`StepOut.batch_index`、
+`SampleIn.max_volume` 与 `TubeStateOut.remaining_capacity` 均已包含在
 schema 中），交互式文档在 `/docs`、`/redoc`。
 
 ### 启动后的示例（含移液损耗追踪）
@@ -123,6 +131,48 @@ curl -s -X POST http://localhost:8000/api/simulations \
 各 6（合计 12 > 10），返回 400，`error.transfer_index` 定位到
 `transfers[1]`，整批不落地、`steps` 为空；之前批次（更小 time）的结果保留。
 
+### 启动后的示例（管容量约束）
+
+样本可声明可选的 `max_volume`（必须 ≥ `initial_volume`，否则 422）。下面
+S2 容量 90：第一步注入 30 后 S2 为 80（`remaining_capacity` 变为 10），
+第二步再注入 20 将达到 100，超容——第二步整步不落地，返回 400：
+
+```bash
+curl -s -X POST http://localhost:8000/api/simulations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "容量约束示例",
+    "samples": [
+      {"id": "S1", "initial_volume": 100, "concentration": 12.5},
+      {"id": "S2", "initial_volume": 50, "markers": {"RFP": 8}, "max_volume": 90}
+    ],
+    "transfers": [
+      {"time": 1, "source": "S1", "target": "S2", "amount": 30},
+      {"time": 2, "source": "S1", "target": "S2", "amount": 20}
+    ]
+  }' | python3 -m json.tool
+```
+
+关键响应（HTTP 400，第一步结果保留，S2 停在 80）：
+
+```json
+{
+  "status": "failed",
+  "error": {
+    "code": "CAPACITY_EXCEEDED",
+    "message": "transfers[1] 向 'S2' 注入 20.0 后，该管体积将达到 100.0，超过容量上限 90.0",
+    "transfer_index": 1,
+    "location": "transfers[1].delivered_amount"
+  }
+}
+```
+
+`time_batch` 模式下容量按**批末净体积**校验：同批同管既收又发时先汇总
+（批末 = 批次开始体积 − 吸出合计 + 注入合计），与数组顺序无关。例如容量
+20 的管 T 当前为 20，同批 `T -> A` 吸 10、`B -> T` 注 10，批末仍是 20，
+无论两条 transfers 谁先谁后都放行；若批末净体积超容，则整批不落地。
+未配置 `max_volume` 的管不做容量校验，旧请求行为不变。
+
 ---
 
 ## 本地开发（不使用 Docker）
@@ -171,13 +221,24 @@ pytest -q
    入管质量 / 入管后总体积。
 5. **超量校验口径**：是否超量始终按吸出量 `amount` 与源管当前体积判断，
    与 `delivered_amount` 无关。
-6. **来源追踪**：每支管记录“来自各初始样本的净体积”。吸出量按源管当前
+6. **管容量约束（可选）**：样本可声明 `max_volume`（必须 ≥
+   `initial_volume`）。每个批次落地前，以批次开始状态为基准按管汇总本批
+   吸出 `amount` 与注入 `delivered_amount`，得到批末净体积
+   （开始体积 − 吸出合计 + 注入合计）并与 `max_volume` 比较——同管同时
+   收发时与数组顺序无关；`sequential` 下每步自成一批，等价于每步实际
+   注入后立即校验目标管。任一管批末净体积超容则**整批不落地**，错误
+   定位到首个使该管投影体积超容的注入操作
+   （`location` 形如 `transfers[i].delivered_amount`），此前批次结果
+   保留。未配置 `max_volume` 的管不限容量，旧请求完全兼容。管状态中的
+   `max_volume` / `remaining_capacity`（= `max_volume` − 当前体积）
+   随时可查，未配置时两者均为 `null`。
+7. **来源追踪**：每支管记录“来自各初始样本的净体积”。吸出量按源管当前
    来源占比在“入管 / 损耗”两部分间分摊；目标管累加入管部分，waste 累加
    损耗部分。管内占比以管内体积为分母、waste 占比以累计损耗体积为分母，
    各自之和恒为 1（空集合除外）。
-7. **浮点处理**：小于 `1e-12` 的残余量按 0 清理，结果保留 12 位小数。
-8. **时间规则**：转移必须按时间**非递减**（允许同一时刻多次操作）。
-9. **执行模式 `execution_mode`**：
+8. **浮点处理**：小于 `1e-12` 的残余量按 0 清理，结果保留 12 位小数。
+9. **时间规则**：转移必须按时间**非递减**（允许同一时刻多次操作）。
+10. **执行模式 `execution_mode`**：
    * `sequential`（默认）：逐条顺序执行，每条转移自成一批
      （`batch_index == index`），与旧版行为完全一致；
    * `time_batch`：解析后 `time` 相等的连续转移合成**一批原子操作**。
@@ -186,6 +247,9 @@ pytest -q
      * 先按源管汇总本批 `amount` 与批次开始可用量比较，任一源管累计
        超量则**整批不落地**，错误定位到原 `transfers` 下标（首个导致
        累计超量的操作，`location` 形如 `transfers[i].amount`）；
+     * 再按批末净体积校验各管 `max_volume`，任一管超容同样**整批不
+       落地**，定位到首个超限注入操作（`location` 形如
+       `transfers[i].delivered_amount`）；
      * 校验通过后再把全部源管减量、目标管增量与 waste 增量**统一写入**；
      * 同批各步的 `source_after` / `target_after` / `conservation`
        都是整批执行后的视图，`batch_index` 相同；守恒以批次为单位，
@@ -236,6 +300,17 @@ curl -s -X POST http://localhost:8000/api/simulations \
 | `sequential`（默认，缺省即此值） | 按数组顺序逐条执行，每条转移一个批次（`batch_index == index`） |
 | `time_batch` | 解析后 `time` 相等的连续转移合为一批原子执行：吸取基于批次开始快照、按源管汇总 `amount` 校验后统一写入；同批每步都带相同 `batch_index` |
 
+`samples[i]` 可选字段 `max_volume`：
+
+| 字段 | 语义 |
+| --- | --- |
+| `max_volume`（缺省不限容量） | 管容量上限，必须 ≥ 该样本的 `initial_volume`（否则 422）。配置后每个批次落地前按批末净体积校验；任一管超容则整批不落地并返回 400（`CAPACITY_EXCEEDED`）。不配置时行为与旧版一致 |
+
+每支管的状态（`initial_states` / `steps[].source_after` /
+`steps[].target_after` / `final_states`）都会带上 `max_volume` 与
+`remaining_capacity`（= `max_volume` − 当前体积）；未配置容量时两者为
+`null`。
+
 time_batch 下若同批对同一源管的合计吸取量超过其批次开始体积（即使每条
 单独看不超量），整批返回 400 且不落地：
 
@@ -265,7 +340,7 @@ time_batch 下若同批对同一源管的合计吸取量超过其批次开始体
   "id": "551a00db...",
   "status": "success",            // 或 "failed"
   "created_at": "2026-09-18T15:24:11Z",
-  "initial_states": [ /* 每支管的初始体积/浓度/来源 */ ],
+  "initial_states": [ /* 每支管的初始体积/容量/浓度/来源 */ ],
   "steps": [
     {
       "index": 0,
@@ -285,8 +360,8 @@ time_batch 下若同批对同一源管的合计吸取量超过其批次开始体
         "marker_amount": {"RFP": 0.0, "default": 25.0},
         "origins": [{"source_id": "S1", "volume": 2.0, "volume_fraction": 1.0}]
       },
-      "source_after": { /* 按吸出量 50 扣减：S1 剩 50 */ },
-      "target_after": { /* 按入管量 48 增加：S2 变为 98 */ },
+      "source_after": { /* 按吸出量 50 扣减：S1 剩 50；含 max_volume / remaining_capacity */ },
+      "target_after": { /* 按入管量 48 增加：S2 变为 98；含 max_volume / remaining_capacity */ },
       "conservation": {
         // before/after 为“所有管内 + 截至本步累计 waste”的系统口径；
         // time_batch 下以整批为单位，同批各步的该字段相同
@@ -354,15 +429,31 @@ time_batch 下若同批对同一源管的合计吸取量超过其批次开始体
 | code | 触发条件 | location 示例 |
 | --- | --- | --- |
 | `INSUFFICIENT_VOLUME` | 转移量超过源管可用体积（time_batch 下为批次内按源管汇总的累计吸取量超过批次开始体积，定位到首个超量操作） | `transfers[i].amount` |
+| `CAPACITY_EXCEEDED` | 目标管批末净体积超过其 `max_volume`（time_batch 下同管同时收发按批末净体积判定，与数组顺序无关；定位到首个使该管投影超容的注入操作，消息中含超限管 id） | `transfers[i].delivered_amount` |
 | `TIME_NOT_ORDERED` | 转移时间早于上一批转移 | `transfers[i].time` |
 | `UNKNOWN_SAMPLE` | 源 / 目标管未在 `samples` 中声明 | `transfers[i].source` / `.target` |
 | `SAME_SOURCE_TARGET` | 源管与目标管相同 | `transfers[i]` |
 | `SIMULATION_NOT_FOUND` | 查询不存在的记录 id | `path.sim_id` |
 
+超容失败示例（S2 容量 90，第二步注入后将达到 100；该步整步不落地，
+此前步骤保留）：
+
+```json
+{
+  "status": "failed",
+  "error": {
+    "code": "CAPACITY_EXCEEDED",
+    "message": "transfers[1] 向 'S2' 注入 20.0 后，该管体积将达到 100.0，超过容量上限 90.0",
+    "transfer_index": 1,
+    "location": "transfers[1].delivered_amount"
+  }
+}
+```
+
 请求体本身的字段问题（负数体积、缺少浓度、未知字段、样本 id 重复、
-`delivered_amount` 非正数或大于 `amount`、`execution_mode` 取值不在
-`sequential` / `time_batch` 中等）返回 FastAPI 标准 `422` 结构，
-`detail[].loc` 指明出错字段路径。
+`max_volume` 小于 `initial_volume`、`delivered_amount` 非正数或大于
+`amount`、`execution_mode` 取值不在 `sequential` / `time_batch` 中等）
+返回 FastAPI 标准 `422` 结构，`detail[].loc` 指明出错字段路径。
 
 ### 查询与列表
 
@@ -385,12 +476,12 @@ curl "http://localhost:8000/api/simulations?status=failed"
 │   ├── __init__.py
 │   ├── main.py        # FastAPI 路由（创建 / 查询 / 列表 / 健康检查）
 │   ├── models.py      # Pydantic 请求与响应模型、时间解析
-│   ├── engine.py      # 混样模拟核心（浓度 / 来源 / 移液损耗 / 守恒）
+│   ├── engine.py      # 混样模拟核心（浓度 / 来源 / 移液损耗 / 容量约束 / 守恒）
 │   └── database.py    # SQLite 连接与记录持久化
 ├── tests/
 │   ├── conftest.py
-│   ├── test_engine.py # 引擎计算、移液损耗 / 来源 / 守恒、time_batch 原子批次与错误定位
-│   └── test_api.py    # API 端到端（含损耗追踪、time_batch / OpenAPI 与持久化）
+│   ├── test_engine.py # 引擎计算、移液损耗 / 来源 / 守恒、容量约束、time_batch 原子批次与错误定位
+│   └── test_api.py    # API 端到端（含损耗追踪、容量约束、time_batch / OpenAPI 与持久化）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

@@ -81,6 +81,15 @@ class SampleIn(BaseModel):
 
     id: str = Field(..., min_length=1, max_length=128, description="样本管唯一编号")
     initial_volume: float = Field(..., gt=0, description="初始体积（任意体积单位，需全局一致）")
+    max_volume: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "管容量上限（可选，与 initial_volume 同单位）；提供时必须不小于 "
+            "initial_volume。配置后任何时刻该管体积都不得超过该上限，否则所在"
+            "批次整批不落地；缺省表示不限容量（兼容旧请求）"
+        ),
+    )
     concentration: Optional[float] = Field(
         default=None, ge=0, description="单一标记物的初始浓度（单位体积含量）"
     )
@@ -97,7 +106,7 @@ class SampleIn(BaseModel):
             raise ValueError("样本 id 不能为空字符串")
         return value
 
-    @field_validator("initial_volume", "concentration")
+    @field_validator("initial_volume", "concentration", "max_volume")
     @classmethod
     def _finite(cls, value: Optional[float]) -> Optional[float]:
         if value is not None:
@@ -126,6 +135,15 @@ class SampleIn(BaseModel):
     def _require_concentration(self) -> "SampleIn":
         if self.concentration is None and not self.markers:
             raise ValueError("每个样本必须提供 concentration 或非空 markers（至少一种标记物）")
+        return self
+
+    @model_validator(mode="after")
+    def _max_volume_not_below_initial(self) -> "SampleIn":
+        if self.max_volume is not None and self.max_volume < self.initial_volume:
+            raise ValueError(
+                f"max_volume（{self.max_volume}）必须不小于 "
+                f"initial_volume（{self.initial_volume}）"
+            )
         return self
 
     def normalized_markers(self) -> dict[str, float]:
@@ -227,6 +245,15 @@ class OriginOut(BaseModel):
 class TubeStateOut(BaseModel):
     id: str
     volume: float
+    max_volume: Optional[float] = Field(
+        default=None, description="管容量上限；样本未配置 max_volume 时为 null"
+    )
+    remaining_capacity: Optional[float] = Field(
+        default=None,
+        description=(
+            "剩余可注入容量（max_volume - 当前体积）；未配置容量上限时为 null"
+        ),
+    )
     concentrations: dict[str, float]
     origins: list[OriginOut]
 

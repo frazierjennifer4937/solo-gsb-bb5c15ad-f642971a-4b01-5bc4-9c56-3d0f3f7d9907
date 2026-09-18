@@ -37,8 +37,22 @@
     均为整批执行后的视图（守恒以批次为单位，覆盖多源、多目标、同管收发
     及 delivered_amount 损耗），``batch_index`` 相同。
 
-失败时（超量、时间逆序、未知样本）返回已完成批次 / 步骤、当时各管状态和
-结构化错误信息，便于定位问题，不抛出业务异常。
+管容量约束（``max_volume``）
+------------------------------
+
+* 样本可声明可选的 ``max_volume``（必须不小于 ``initial_volume``）；
+  未声明的管不限容量，旧请求行为不变；
+* 每个批次落地前统一做容量校验：以批次开始状态为基准，按管汇总本批
+  吸出 ``amount`` 与注入 ``delivered_amount``，得到**批末净体积**
+  （开始体积 − 吸出合计 + 注入合计），与 ``max_volume`` 比较——同管
+  同时收发时结果与数组顺序无关；``sequential`` 模式下每步自成一批，
+  等价于每步实际注入后立即校验目标管；
+* 任一管批末净体积超容则**整批不落地**，错误定位到首个使该管投影体积
+  超容的注入操作（``location`` 形如 ``transfers[i].delivered_amount``），
+  此前批次的结果保留。
+
+失败时（超量、超容、时间逆序、未知样本）返回已完成批次 / 步骤、当时各管
+状态和结构化错误信息，便于定位问题，不抛出业务异常。
 """
 from __future__ import annotations
 
@@ -71,6 +85,8 @@ class _Tube:
     marker_amount: dict[str, float]
     # 来源构成：初始样本 id -> 净转入体积
     origins: dict[str, float] = field(default_factory=dict)
+    # 管容量上限；None 表示不限容量
+    max_volume: Optional[float] = None
 
 
 def _clean(value: float) -> float:
@@ -109,9 +125,16 @@ def _origins_view(shares: dict[str, float], total: float) -> list[dict]:
 
 def _snapshot(tube: _Tube, all_markers: list[str]) -> dict:
     """对外的管状态视图（来源占比之和恒为 1，空管除外）。"""
+    remaining_capacity = (
+        None
+        if tube.max_volume is None
+        else _clean(tube.max_volume - tube.volume)
+    )
     return {
         "id": tube.id,
         "volume": _clean(tube.volume),
+        "max_volume": tube.max_volume,
+        "remaining_capacity": remaining_capacity,
         "concentrations": _concentrations(tube, all_markers),
         "origins": _origins_view(tube.origins, tube.volume),
     }
@@ -252,6 +275,89 @@ def _validate_batch_volume(
                 f"transfers[{index}].amount",
             )
     return None
+
+
+def _validate_batch_capacity(
+    batch: list[TransferIn],
+    start_index: int,
+    tubes: dict[str, _Tube],
+    batch_size: int,
+    mode: str,
+) -> Optional[dict]:
+    """基于批次开始状态，按批末净体积校验各管容量上限（max_volume）。
+
+    对每支配置了容量上限的管，以批次开始体积为基准汇总本批吸出
+    ``amount`` 与注入 ``delivered_amount``，批末净体积 =
+    开始体积 − 吸出合计 + 注入合计；同管同时收发时结果与数组顺序无关。
+    未配置 ``max_volume`` 的管不参与校验（兼容旧请求）。
+
+    任一管批末净体积超容则整批不落地；错误定位到原 transfers 序列中
+    **首个**使某超限管投影体积超过容量的注入操作（该操作必然存在：
+    批末超容而批次开始时不超容，体积的净增只能来自注入）。
+    """
+    capped = {tid: t for tid, t in tubes.items() if t.max_volume is not None}
+    if not capped:
+        return None
+
+    # 投影体积随遍历推进即为批末净体积；同时记录每支管首次投影超容的
+    # 注入操作下标（中间超容后又恢复的管不算超限，最终以批末为准）
+    projected = {tid: t.volume for tid, t in capped.items()}
+    first_overflow: dict[str, int] = {}
+    for offset, transfer in enumerate(batch):
+        delivered = (
+            transfer.amount
+            if transfer.delivered_amount is None
+            else transfer.delivered_amount
+        )
+        if transfer.source in capped:
+            projected[transfer.source] -= transfer.amount
+        if transfer.target in capped:
+            projected[transfer.target] += delivered
+            limit = capped[transfer.target].max_volume
+            if (
+                transfer.target not in first_overflow
+                and projected[transfer.target] > limit + ZERO_EPS
+            ):
+                first_overflow[transfer.target] = offset
+
+    overflowed = [
+        tid
+        for tid, volume in projected.items()
+        if volume > capped[tid].max_volume + ZERO_EPS
+    ]
+    if not overflowed:
+        return None
+
+    # 多管同时超容时，定位到数组中最早发生的超限注入事件
+    tube_id = min(overflowed, key=lambda tid: first_overflow[tid])
+    offset = first_overflow[tube_id]
+    index = start_index + offset
+    limit = capped[tube_id].max_volume
+    net = projected[tube_id]
+    transfer = batch[offset]
+    delivered = (
+        transfer.amount
+        if transfer.delivered_amount is None
+        else transfer.delivered_amount
+    )
+    if mode == "time_batch" and batch_size > 1:
+        message = (
+            f"transfers[{index}] 使批次（batch 起始于 "
+            f"transfers[{start_index}]，共 {batch_size} 个同时刻操作）"
+            f"中 {tube_id!r} 的批末净体积达到 {_clean(net)}，"
+            f"超过该管容量上限 {_clean(limit)}"
+        )
+    else:
+        message = (
+            f"transfers[{index}] 向 {tube_id!r} 注入 {_clean(delivered)} 后，"
+            f"该管体积将达到 {_clean(net)}，超过容量上限 {_clean(limit)}"
+        )
+    return _build_error(
+        "CAPACITY_EXCEEDED",
+        message,
+        index,
+        f"transfers[{index}].delivered_amount",
+    )
 
 
 def _execute_batch(
@@ -459,6 +565,7 @@ def run_simulation(request: SimulationRequest) -> dict:
                 for name in all_markers
             },
             origins={sample.id: sample.initial_volume},
+            max_volume=sample.max_volume,
         )
 
     initial_states = [_snapshot(tubes[s.id], all_markers) for s in samples]
@@ -516,6 +623,15 @@ def run_simulation(request: SimulationRequest) -> dict:
         )
         if volume_error is not None:
             error = volume_error
+            break
+
+        # 容量校验：按批末净体积（开始体积 − 吸出合计 + 注入合计）与各管
+        # max_volume 比较；未配置容量的管跳过
+        capacity_error = _validate_batch_capacity(
+            batch, position, tubes, len(batch), request.execution_mode
+        )
+        if capacity_error is not None:
+            error = capacity_error
             break
 
         # 校验全部通过：原子落地整批

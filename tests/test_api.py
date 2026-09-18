@@ -359,3 +359,126 @@ def test_openapi_documents_execution_mode_and_batch_index(client):
     )
     step_props = schema["components"]["schemas"]["StepOut"]["properties"]
     assert "batch_index" in step_props
+
+
+# ---------- 管容量约束（max_volume） ----------
+
+
+def test_max_volume_below_initial_volume_rejected_422(client):
+    payload = {
+        "samples": [
+            {
+                "id": "A",
+                "initial_volume": 100.0,
+                "concentration": 1.0,
+                "max_volume": 50.0,
+            }
+        ],
+        "transfers": [],
+    }
+    response = client.post("/api/simulations", json=payload)
+    assert response.status_code == 422
+    assert "max_volume" in str(response.json()["detail"])
+
+
+def test_capacity_exceeded_returns_400_and_persisted(client):
+    payload = {
+        "samples": [
+            {"id": "A", "initial_volume": 100.0, "concentration": 10.0},
+            {
+                "id": "B",
+                "initial_volume": 80.0,
+                "concentration": 0.0,
+                "max_volume": 100.0,
+            },
+        ],
+        "transfers": [
+            {"time": 1, "source": "A", "target": "B", "amount": 30.0},
+        ],
+    }
+    created = client.post("/api/simulations", json=payload)
+    assert created.status_code == 400
+    body = created.json()
+    assert body["status"] == "failed"
+    assert body["error"]["code"] == "CAPACITY_EXCEEDED"
+    assert body["error"]["transfer_index"] == 0
+    assert body["error"]["location"] == "transfers[0].delivered_amount"
+    assert "'B'" in body["error"]["message"]
+    # 整步不落地
+    assert body["steps"] == []
+    assert {t["id"]: t["volume"] for t in body["final_states"]} == {
+        "A": 100.0,
+        "B": 80.0,
+    }
+
+    # 失败记录同样落库，GET 返回 400 + 完整内容
+    fetched = client.get(f"/api/simulations/{body['id']}")
+    assert fetched.status_code == 400
+    assert fetched.json()["error"]["code"] == "CAPACITY_EXCEEDED"
+
+
+def test_time_batch_capacity_exceeded_returns_400(client):
+    # 同批两条注入使 C 批末净体积 50 + 30 + 40 = 120 > 100，整批不落地
+    payload = {
+        "execution_mode": "time_batch",
+        "samples": [
+            {"id": "A", "initial_volume": 100.0, "concentration": 1.0},
+            {"id": "B", "initial_volume": 100.0, "concentration": 0.0},
+            {
+                "id": "C",
+                "initial_volume": 50.0,
+                "concentration": 0.0,
+                "max_volume": 100.0,
+            },
+        ],
+        "transfers": [
+            {"time": 1, "source": "A", "target": "C", "amount": 30.0},
+            {"time": 1, "source": "B", "target": "C", "amount": 40.0},
+        ],
+    }
+    response = client.post("/api/simulations", json=payload)
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"]["code"] == "CAPACITY_EXCEEDED"
+    assert body["error"]["transfer_index"] == 1
+    assert body["error"]["location"] == "transfers[1].delivered_amount"
+    assert body["steps"] == []
+
+
+def test_tube_state_capacity_fields_in_response(client):
+    payload = {
+        "samples": [
+            {
+                "id": "A",
+                "initial_volume": 100.0,
+                "concentration": 10.0,
+                "max_volume": 120.0,
+            },
+            {"id": "B", "initial_volume": 50.0, "concentration": 0.0},
+        ],
+        "transfers": [{"time": 1, "source": "A", "target": "B", "amount": 30.0}],
+    }
+    created = client.post("/api/simulations", json=payload)
+    assert created.status_code == 201
+    body = created.json()
+
+    a = next(t for t in body["final_states"] if t["id"] == "A")
+    assert a["max_volume"] == 120.0
+    assert a["remaining_capacity"] == 50.0
+    b = next(t for t in body["final_states"] if t["id"] == "B")
+    assert b["max_volume"] is None
+    assert b["remaining_capacity"] is None
+
+    # 持久化后复查，容量字段保持一致
+    fetched = client.get(f"/api/simulations/{body['id']}").json()
+    a_saved = next(t for t in fetched["final_states"] if t["id"] == "A")
+    assert a_saved["remaining_capacity"] == 50.0
+
+
+def test_openapi_documents_max_volume_and_capacity_fields(client):
+    schema = client.get("/openapi.json").json()
+    sample_props = schema["components"]["schemas"]["SampleIn"]["properties"]
+    assert "max_volume" in sample_props
+    tube_props = schema["components"]["schemas"]["TubeStateOut"]["properties"]
+    assert "max_volume" in tube_props
+    assert "remaining_capacity" in tube_props
