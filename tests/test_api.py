@@ -359,3 +359,125 @@ def test_openapi_documents_execution_mode_and_batch_index(client):
     )
     step_props = schema["components"]["schemas"]["StepOut"]["properties"]
     assert "batch_index" in step_props
+
+
+# ---------- 管容量约束（max_volume） ----------
+
+
+def test_max_volume_fields_in_states(client):
+    payload = {
+        "samples": [
+            {"id": "A", "initial_volume": 80.0, "max_volume": 100.0, "concentration": 1.0},
+            {"id": "B", "initial_volume": 50.0, "concentration": 0.0},
+        ],
+        "transfers": [
+            {"time": 1, "source": "A", "target": "B", "amount": 20.0},
+        ],
+    }
+    response = client.post("/api/simulations", json=payload)
+    assert response.status_code == 201
+    body = response.json()
+
+    initial = {t["id"]: t for t in body["initial_states"]}
+    assert initial["A"]["max_volume"] == 100.0
+    assert initial["A"]["remaining_capacity"] == 20.0
+    # 未配置容量：旧请求兼容，字段为 null
+    assert initial["B"]["max_volume"] is None
+    assert initial["B"]["remaining_capacity"] is None
+
+    final = {t["id"]: t for t in body["final_states"]}
+    assert final["A"]["remaining_capacity"] == 40.0
+    assert final["B"]["max_volume"] is None
+
+    # 持久化后复查字段仍在
+    fetched = client.get(f"/api/simulations/{body['id']}")
+    saved_initial = {t["id"]: t for t in fetched.json()["initial_states"]}
+    assert saved_initial["A"]["max_volume"] == 100.0
+
+
+def test_over_capacity_returns_400_with_location(client):
+    payload = {
+        "samples": [
+            {"id": "A", "initial_volume": 100.0, "concentration": 1.0},
+            {"id": "B", "initial_volume": 90.0, "max_volume": 100.0, "concentration": 0.0},
+        ],
+        "transfers": [
+            {"time": 1, "source": "A", "target": "B", "amount": 15.0},
+        ],
+    }
+    response = client.post("/api/simulations", json=payload)
+    assert response.status_code == 400
+    body = response.json()
+    assert body["status"] == "failed"
+    error = body["error"]
+    assert error["code"] == "TUBE_OVER_CAPACITY"
+    assert error["transfer_index"] == 0
+    assert error["location"] == "transfers[0].delivered_amount"
+    # 超限管可在 message 中定位，整步不落地
+    assert "'B'" in error["message"]
+    assert body["steps"] == []
+
+    # 失败记录同样持久化，复查返回 400
+    fetched = client.get(f"/api/simulations/{body['id']}")
+    assert fetched.status_code == 400
+    assert fetched.json()["error"]["code"] == "TUBE_OVER_CAPACITY"
+
+
+def test_time_batch_over_capacity_whole_batch_aborts_previous_kept(client):
+    # 第一批 B 恰好满容 50；第二批同管同时收发，批末净 65 > 50：
+    # 整批不落地，第一批保留
+    payload = {
+        "execution_mode": "time_batch",
+        "samples": [
+            {"id": "A", "initial_volume": 100.0, "concentration": 10.0},
+            {"id": "B", "initial_volume": 10.0, "max_volume": 50.0, "concentration": 0.0},
+        ],
+        "transfers": [
+            {"time": 1, "source": "A", "target": "B", "amount": 40.0},
+            {"time": 2, "source": "A", "target": "B", "amount": 20.0},
+            {"time": 2, "source": "B", "target": "A", "amount": 5.0},
+        ],
+    }
+    response = client.post("/api/simulations", json=payload)
+    assert response.status_code == 400
+    body = response.json()
+    error = body["error"]
+    assert error["code"] == "TUBE_OVER_CAPACITY"
+    assert error["transfer_index"] == 1
+    assert error["location"] == "transfers[1].delivered_amount"
+    assert len(body["steps"]) == 1
+    assert {t["id"]: t["volume"] for t in body["final_states"]} == {
+        "A": 60.0,
+        "B": 50.0,
+    }
+
+
+def test_max_volume_below_initial_volume_returns_422(client):
+    payload = {
+        "samples": [
+            {"id": "A", "initial_volume": 100.0, "max_volume": 50.0, "concentration": 1.0},
+        ],
+        "transfers": [],
+    }
+    response = client.post("/api/simulations", json=payload)
+    assert response.status_code == 422
+    text = str(response.json()["detail"])
+    assert "max_volume" in text
+
+
+def test_legacy_request_capacity_fields_null(client):
+    response = client.post("/api/simulations", json=VALID_PAYLOAD)
+    assert response.status_code == 201
+    body = response.json()
+    for state in body["initial_states"] + body["final_states"]:
+        assert state["max_volume"] is None
+        assert state["remaining_capacity"] is None
+
+
+def test_openapi_documents_max_volume_fields(client):
+    schema = client.get("/openapi.json").json()
+    sample_props = schema["components"]["schemas"]["SampleIn"]["properties"]
+    assert "max_volume" in sample_props
+    tube_props = schema["components"]["schemas"]["TubeStateOut"]["properties"]
+    assert "max_volume" in tube_props
+    assert "remaining_capacity" in tube_props

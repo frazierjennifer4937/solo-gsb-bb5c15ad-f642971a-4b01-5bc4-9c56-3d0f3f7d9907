@@ -1,4 +1,7 @@
 """引擎层测试：混合浓度、来源占比、守恒与各类业务错误。"""
+import pydantic
+import pytest
+
 from app.engine import run_simulation
 from app.models import SampleIn, SimulationRequest, TransferIn
 
@@ -644,6 +647,274 @@ def test_time_batch_unknown_sample_aborts_whole_batch():
     assert result["error"]["location"] == "transfers[0].target"
     assert result["steps"] == []
     assert result["final_states"][0]["volume"] == 10.0
+
+
+# ---------- 管容量约束（max_volume） ----------
+
+
+def test_tube_states_report_max_volume_and_remaining_capacity():
+    request = SimulationRequest(
+        samples=[
+            SampleIn(id="A", initial_volume=80.0, max_volume=100.0, concentration=1.0),
+            SampleIn(id="B", initial_volume=50.0, concentration=0.0),
+        ],
+        transfers=[TransferIn(time=1, source="A", target="B", amount=20.0)],
+    )
+    result = run_simulation(request)
+    assert result["status"] == "success"
+
+    initial = {t["id"]: t for t in result["initial_states"]}
+    assert initial["A"]["max_volume"] == 100.0
+    assert initial["A"]["remaining_capacity"] == 20.0
+    # 未配置容量：两个字段均为 null（旧请求兼容）
+    assert initial["B"]["max_volume"] is None
+    assert initial["B"]["remaining_capacity"] is None
+
+    final = {t["id"]: t for t in result["final_states"]}
+    # A 吸出 20：剩 60，剩余容量 40；B 无容量限制
+    assert final["A"]["volume"] == 60.0
+    assert final["A"]["max_volume"] == 100.0
+    assert final["A"]["remaining_capacity"] == 40.0
+    assert final["B"]["max_volume"] is None
+    assert final["B"]["remaining_capacity"] is None
+
+    # 每步的 source_after / target_after 同样带容量字段
+    assert result["steps"][0]["target_after"]["max_volume"] is None
+    assert result["steps"][0]["source_after"]["remaining_capacity"] == 40.0
+
+
+def test_sequential_over_capacity_aborts_step():
+    request = SimulationRequest(
+        samples=[
+            SampleIn(id="A", initial_volume=100.0, concentration=1.0),
+            SampleIn(id="B", initial_volume=90.0, max_volume=100.0, concentration=0.0),
+        ],
+        transfers=[TransferIn(time=1, source="A", target="B", amount=15.0)],
+    )
+    result = run_simulation(request)
+    assert result["status"] == "failed"
+    error = result["error"]
+    assert error["code"] == "TUBE_OVER_CAPACITY"
+    assert error["transfer_index"] == 0
+    assert error["location"] == "transfers[0].delivered_amount"
+    assert "'B'" in error["message"]
+    assert "105.0" in error["message"] and "100.0" in error["message"]
+    # 整步不落地：状态停留在注入前
+    assert result["steps"] == []
+    assert {t["id"]: t["volume"] for t in result["final_states"]} == {
+        "A": 100.0,
+        "B": 90.0,
+    }
+    # 失败现场仍给出容量信息
+    b = next(t for t in result["final_states"] if t["id"] == "B")
+    assert b["max_volume"] == 100.0
+    assert b["remaining_capacity"] == 10.0
+
+
+def test_sequential_capacity_uses_delivered_amount():
+    # 吸出 15 但实际只注入 5（损耗 10），B 恰好到 100，不超容
+    request = SimulationRequest(
+        samples=[
+            SampleIn(id="A", initial_volume=100.0, concentration=1.0),
+            SampleIn(id="B", initial_volume=95.0, max_volume=100.0, concentration=0.0),
+        ],
+        transfers=[
+            TransferIn(
+                time=1, source="A", target="B", amount=15.0, delivered_amount=5.0
+            )
+        ],
+    )
+    result = run_simulation(request)
+    assert result["status"] == "success"
+    final = {t["id"]: t for t in result["final_states"]}
+    assert final["A"]["volume"] == 85.0
+    assert final["B"]["volume"] == 100.0
+    assert final["B"]["remaining_capacity"] == 0.0
+
+
+def test_sequential_over_capacity_keeps_previous_steps():
+    request = SimulationRequest(
+        samples=[
+            SampleIn(id="A", initial_volume=100.0, concentration=1.0),
+            SampleIn(id="B", initial_volume=10.0, max_volume=50.0, concentration=0.0),
+        ],
+        transfers=[
+            TransferIn(time=1, source="A", target="B", amount=40.0),
+            TransferIn(time=2, source="A", target="B", amount=20.0),
+        ],
+    )
+    result = run_simulation(request)
+    assert result["status"] == "failed"
+    assert result["error"]["code"] == "TUBE_OVER_CAPACITY"
+    assert result["error"]["transfer_index"] == 1
+    assert result["error"]["location"] == "transfers[1].delivered_amount"
+    # 第一步后 B 恰好满容（50）并保留；第二步不落地
+    assert len(result["steps"]) == 1
+    assert {t["id"]: t["volume"] for t in result["final_states"]} == {
+        "A": 60.0,
+        "B": 50.0,
+    }
+
+
+def test_capacity_boundary_exactly_full_ok():
+    request = SimulationRequest(
+        samples=[
+            SampleIn(id="A", initial_volume=10.0, concentration=1.0),
+            SampleIn(id="B", initial_volume=90.0, max_volume=100.0, concentration=0.0),
+        ],
+        transfers=[TransferIn(time=1, source="A", target="B", amount=10.0)],
+    )
+    result = run_simulation(request)
+    assert result["status"] == "success"
+    b = next(t for t in result["final_states"] if t["id"] == "B")
+    assert b["volume"] == 100.0
+    assert b["remaining_capacity"] == 0.0
+
+
+def test_tube_without_max_volume_has_no_capacity_limit():
+    # 不配置 max_volume：接收远超初始体积的注入也合法（旧行为）
+    request = SimulationRequest(
+        samples=[
+            SampleIn(id="A", initial_volume=100.0, concentration=1.0),
+            SampleIn(id="B", initial_volume=1.0, concentration=0.0),
+        ],
+        transfers=[TransferIn(time=1, source="A", target="B", amount=100.0)],
+    )
+    result = run_simulation(request)
+    assert result["status"] == "success"
+    b = next(t for t in result["final_states"] if t["id"] == "B")
+    assert b["volume"] == 101.0
+    assert b["max_volume"] is None
+    assert b["remaining_capacity"] is None
+
+
+# ---------- time_batch 下的管容量 ----------
+
+
+def test_time_batch_capacity_net_volume_order_independent_success():
+    # 同管同时收发：B 开始 95 / 容量 100，吸出 10 同时收 10 => 批末净 100
+    samples = [
+        SampleIn(id="A", initial_volume=100.0, concentration=10.0),
+        SampleIn(id="B", initial_volume=95.0, max_volume=100.0, concentration=0.0),
+    ]
+    transfers_one = [
+        TransferIn(time=1, source="A", target="B", amount=10.0),
+        TransferIn(time=1, source="B", target="A", amount=10.0),
+    ]
+    transfers_two = list(reversed(transfers_one))
+
+    result_one = _run_time_batch(samples, transfers_one)
+    result_two = _run_time_batch(samples, transfers_two)
+    assert result_one["status"] == "success"
+    assert result_two["status"] == "success"
+    assert result_one["final_states"] == result_two["final_states"]
+    final = {t["id"]: t for t in result_one["final_states"]}
+    assert final["B"]["volume"] == 95.0
+    assert final["B"]["remaining_capacity"] == 5.0
+
+
+def test_time_batch_capacity_order_independent_failure():
+    # 两种数组顺序都必须失败，且定位到首个向超限管注入的操作
+    samples = [
+        SampleIn(id="A", initial_volume=100.0, concentration=10.0),
+        SampleIn(id="B", initial_volume=95.0, max_volume=100.0, concentration=0.0),
+    ]
+    # B 收 10、B 出 2：批末净 95 + 10 - 2 = 103 > 100
+    order_one = [
+        TransferIn(time=1, source="A", target="B", amount=10.0),
+        TransferIn(time=1, source="B", target="A", amount=2.0),
+    ]
+    order_two = list(reversed(order_one))
+
+    for order, transfers in ((0, order_one), (1, order_two)):
+        result = _run_time_batch(samples, transfers)
+        assert result["status"] == "failed"
+        error = result["error"]
+        assert error["code"] == "TUBE_OVER_CAPACITY"
+        # A->B 是首个向 B 注入的操作；逆序后它位于 transfers[1]
+        assert error["transfer_index"] == order
+        assert error["location"] == f"transfers[{order}].delivered_amount"
+        assert result["steps"] == []
+        assert {t["id"]: t["volume"] for t in result["final_states"]} == {
+            "A": 100.0,
+            "B": 95.0,
+        }
+
+
+def test_time_batch_capacity_aggregates_multiple_injections():
+    # 单条注入不超容，合计注入 15（无吸出）使 B 批末 110 > 100：整批不落地，
+    # 定位首个向 B 注入的操作
+    result = _run_time_batch(
+        samples=[
+            SampleIn(id="A", initial_volume=100.0, concentration=1.0),
+            SampleIn(id="B", initial_volume=95.0, max_volume=100.0, concentration=0.0),
+            SampleIn(id="C", initial_volume=100.0, concentration=1.0),
+        ],
+        transfers=[
+            TransferIn(time=1, source="A", target="B", amount=8.0),
+            TransferIn(time=1, source="C", target="B", amount=7.0),
+        ],
+    )
+    assert result["status"] == "failed"
+    error = result["error"]
+    assert error["code"] == "TUBE_OVER_CAPACITY"
+    assert error["transfer_index"] == 0
+    assert error["location"] == "transfers[0].delivered_amount"
+    assert result["steps"] == []
+
+
+def test_time_batch_capacity_failure_keeps_previous_batches():
+    result = _run_time_batch(
+        samples=[
+            SampleIn(id="A", initial_volume=100.0, concentration=1.0),
+            SampleIn(id="B", initial_volume=10.0, max_volume=50.0, concentration=0.0),
+        ],
+        transfers=[
+            TransferIn(time=1, source="A", target="B", amount=40.0),
+            TransferIn(time=2, source="A", target="B", amount=30.0),
+            TransferIn(time=2, source="A", target="B", amount=1.0),
+        ],
+    )
+    assert result["status"] == "failed"
+    error = result["error"]
+    assert error["code"] == "TUBE_OVER_CAPACITY"
+    assert error["transfer_index"] == 1
+    assert error["location"] == "transfers[1].delivered_amount"
+    # 第一批后 B 恰好满容（50）并保留，第二批（time=2）整批不落地
+    assert len(result["steps"]) == 1
+    assert result["steps"][0]["batch_index"] == 0
+    assert {t["id"]: t["volume"] for t in result["final_states"]} == {
+        "A": 60.0,
+        "B": 50.0,
+    }
+
+
+def test_time_batch_capacity_uses_delivered_amount():
+    # B 容量 100、开始 95；同批两次注入 delivered 各 3（吸出各 10，损耗各 7），
+    # 批末净 95 + 3 + 3 = 101 > 100：按实际入管量判超容
+    result = _run_time_batch(
+        samples=[
+            SampleIn(id="A", initial_volume=100.0, concentration=1.0),
+            SampleIn(id="B", initial_volume=95.0, max_volume=100.0, concentration=0.0),
+        ],
+        transfers=[
+            TransferIn(
+                time=1, source="A", target="B", amount=10.0, delivered_amount=3.0
+            ),
+            TransferIn(
+                time=1, source="A", target="B", amount=10.0, delivered_amount=3.0
+            ),
+        ],
+    )
+    assert result["status"] == "failed"
+    assert result["error"]["code"] == "TUBE_OVER_CAPACITY"
+    assert result["error"]["transfer_index"] == 0
+    assert result["steps"] == []
+
+
+def test_max_volume_below_initial_volume_rejected():
+    with pytest.raises(pydantic.ValidationError):
+        SampleIn(id="A", initial_volume=100.0, max_volume=50.0, concentration=1.0)
 
 
 def test_structure_error_precedence_over_time_matches_sequential():

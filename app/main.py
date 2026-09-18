@@ -24,14 +24,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="实验室样本混样追踪 API",
     description=(
-        "提交初始样本（体积 + 标记物浓度）和按时间排序的转移操作，"
-        "服务逐步计算混合浓度与来源占比，并对含移液损耗（可选 "
-        "delivered_amount）的系统按“所有管内 + 累计 waste”口径做守恒校验，"
-        "每次模拟记录持久化到 SQLite。execution_mode=time_batch 时，"
+        "提交初始样本（体积 + 标记物浓度，可选 max_volume 管容量）和按时间"
+        "排序的转移操作，服务逐步计算混合浓度与来源占比，并对含移液损耗"
+        "（可选 delivered_amount）的系统按“所有管内 + 累计 waste”口径做"
+        "守恒校验，每次模拟记录持久化到 SQLite。execution_mode=time_batch 时，"
         "同一时刻的连续转移按批原子执行：吸取均基于批次开始快照，"
-        "先按源管汇总校验可用量，再统一写入，结果与数组顺序无关。"
+        "先按源管汇总校验可用量，再按批末净体积统一校验各管 max_volume，"
+        "然后统一写入，结果与数组顺序无关；任一管超容整批不落地。"
     ),
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -60,7 +61,7 @@ def health() -> dict:
     response_model=SimulationResult,
     responses={
         201: {"model": SimulationResult, "description": "模拟成功并已保存"},
-        400: {"model": SimulationResult, "description": "业务规则失败（超量 / 时间逆序 / 未知样本）"},
+        400: {"model": SimulationResult, "description": "业务规则失败（超量 / 超容量 / 时间逆序 / 未知样本）"},
         422: {"description": "请求体格式 / 字段校验失败（FastAPI 标准错误结构）"},
     },
     status_code=status.HTTP_201_CREATED,
@@ -72,9 +73,10 @@ def create_simulation(
 ) -> JSONResponse:
     """执行模拟并落库。
 
-    返回 ``201`` 表示业务模拟成功；当转移超量、时间逆序或引用未知样本等
-    业务规则失败时返回 ``400``，响应体中 ``status=failed`` 且 ``error``
-    给出错误码、可读信息和精确定位（如 ``transfers[2].source``）。
+    返回 ``201`` 表示业务模拟成功；当转移超量、注入后超过管容量
+    （max_volume）、时间逆序或引用未知样本等业务规则失败时返回 ``400``，
+    响应体中 ``status=failed`` 且 ``error`` 给出错误码、可读信息和精确定位
+    （如 ``transfers[2].source``、``transfers[i].delivered_amount``）。
     """
     result = engine.run_simulation(request)
     record = database.insert_simulation(db, result)

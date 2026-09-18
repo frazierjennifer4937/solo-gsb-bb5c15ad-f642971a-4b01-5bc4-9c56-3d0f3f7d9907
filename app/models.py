@@ -81,6 +81,14 @@ class SampleIn(BaseModel):
 
     id: str = Field(..., min_length=1, max_length=128, description="样本管唯一编号")
     initial_volume: float = Field(..., gt=0, description="初始体积（任意体积单位，需全局一致）")
+    max_volume: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "管容量上限（可选）：配置后任何时刻管内体积都不得超过该值，"
+            "且必须不小于 initial_volume；不传表示不限制容量（旧请求兼容）"
+        ),
+    )
     concentration: Optional[float] = Field(
         default=None, ge=0, description="单一标记物的初始浓度（单位体积含量）"
     )
@@ -97,7 +105,7 @@ class SampleIn(BaseModel):
             raise ValueError("样本 id 不能为空字符串")
         return value
 
-    @field_validator("initial_volume", "concentration")
+    @field_validator("initial_volume", "max_volume", "concentration")
     @classmethod
     def _finite(cls, value: Optional[float]) -> Optional[float]:
         if value is not None:
@@ -121,6 +129,15 @@ class SampleIn(BaseModel):
                 raise ValueError(f"标记物 {name!r} 的浓度不能为负")
             normalized[name.strip()] = value
         return normalized
+
+    @model_validator(mode="after")
+    def _capacity_not_below_initial(self) -> "SampleIn":
+        if self.max_volume is not None and self.max_volume < self.initial_volume:
+            raise ValueError(
+                f"max_volume（{self.max_volume}）不得小于 initial_volume"
+                f"（{self.initial_volume}）"
+            )
+        return self
 
     @model_validator(mode="after")
     def _require_concentration(self) -> "SampleIn":
@@ -227,6 +244,16 @@ class OriginOut(BaseModel):
 class TubeStateOut(BaseModel):
     id: str
     volume: float
+    max_volume: Optional[float] = Field(
+        default=None,
+        description="管容量上限；样本未配置 max_volume 时为 null（不限制容量）",
+    )
+    remaining_capacity: Optional[float] = Field(
+        default=None,
+        description=(
+            "剩余容量 max_volume - volume；样本未配置 max_volume 时为 null"
+        ),
+    )
     concentrations: dict[str, float]
     origins: list[OriginOut]
 

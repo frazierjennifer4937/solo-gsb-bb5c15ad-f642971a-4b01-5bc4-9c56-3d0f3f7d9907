@@ -18,6 +18,14 @@
   单独给出，与含 waste 的系统总量差（应恒为 0）区分；
 * 来源占比按“来自各初始样本管的净体积 / 当前口径总体积”计算
   （管内占比以管内体积为分母，waste 占比以累计损耗体积为分母）。
+* **管容量约束（可选 ``max_volume``）**：样本声明 ``max_volume`` 后，管内
+  体积任何时刻都不得超过它（未声明则不限制，旧请求完全兼容）。
+  sequential 模式在每步实际注入（按 ``delivered_amount``）后校验目标管；
+  time_batch 模式以**批次开始状态**为基线，按管汇总同批吸出 ``amount``
+  与实际注入 ``delivered_amount``，用批末净体积统一校验，因此同一支管
+  同时收、发时结果与数组顺序无关。任一管超容则**整批不落地**（此前批次
+  已提交的结果保留），错误定位到原 ``transfers`` 下标
+  （``transfers[i].delivered_amount``）。
 
 执行模式（``execution_mode``）
 ------------------------------
@@ -32,6 +40,10 @@
   * 先按源管汇总本批 ``amount`` 与批次开始可用量比较，任一源管超量则
     整批不落地，错误定位到原 ``transfers`` 下标（首个导致累计超量的
     操作）；此前已提交批次的结果保留；
+  * 容量校验以批次开始状态为基线：按管汇总同批吸出 ``amount``（减量）
+    与实际注入 ``delivered_amount``（增量），以批末净体积与各管
+    ``max_volume`` 统一比较，同管同时收发时与数组顺序无关；任一管超容
+    同样整批不落地，定位到首个向超限管注入的操作；
   * 校验通过后再把全部转移的目标管增量、源管减量与 waste 增量统一写入；
   * 同批各步的 ``source_after`` / ``target_after`` / ``conservation``
     均为整批执行后的视图（守恒以批次为单位，覆盖多源、多目标、同管收发
@@ -71,6 +83,8 @@ class _Tube:
     marker_amount: dict[str, float]
     # 来源构成：初始样本 id -> 净转入体积
     origins: dict[str, float] = field(default_factory=dict)
+    # 管容量上限；None 表示不限制（样本未声明 max_volume）
+    max_volume: Optional[float] = None
 
 
 def _clean(value: float) -> float:
@@ -109,9 +123,14 @@ def _origins_view(shares: dict[str, float], total: float) -> list[dict]:
 
 def _snapshot(tube: _Tube, all_markers: list[str]) -> dict:
     """对外的管状态视图（来源占比之和恒为 1，空管除外）。"""
+    max_volume = _clean(tube.max_volume) if tube.max_volume is not None else None
     return {
         "id": tube.id,
         "volume": _clean(tube.volume),
+        "max_volume": max_volume,
+        "remaining_capacity": (
+            _clean(tube.max_volume - tube.volume) if max_volume is not None else None
+        ),
         "concentrations": _concentrations(tube, all_markers),
         "origins": _origins_view(tube.origins, tube.volume),
     }
@@ -251,6 +270,78 @@ def _validate_batch_volume(
                 index,
                 f"transfers[{index}].amount",
             )
+    return None
+
+
+def _effective_delivered(transfer: TransferIn) -> float:
+    """实际入管量：未传 delivered_amount 时按无损处理（等于 amount）。"""
+    return transfer.amount if transfer.delivered_amount is None else transfer.delivered_amount
+
+
+def _validate_batch_capacity(
+    batch: list[TransferIn],
+    start_index: int,
+    tubes: dict[str, _Tube],
+    batch_size: int,
+    mode: str,
+) -> Optional[dict]:
+    """基于批次开始状态，以批末净体积统一校验各管容量。
+
+    对每支声明了 ``max_volume`` 的管，批末净体积 =
+    批次开始体积 - Σ 同批从该管吸出的 amount + Σ 同批注入该管的
+    delivered_amount。同管同时收发时减量与增量一并计入，结果与批次内
+    数组顺序无关。任一管超容即返回错误，定位到原 transfers 序列中
+    **首个**向该超限管注入的操作（其 ``delivered_amount`` 使管内容量
+    不足）。
+    """
+    start_volume = {tid: t.volume for tid, t in tubes.items()}
+    aspirated: dict[str, float] = {}
+    injected: dict[str, float] = {}
+    for transfer in batch:
+        aspirated[transfer.source] = (
+            aspirated.get(transfer.source, 0.0) + transfer.amount
+        )
+        delivered = _effective_delivered(transfer)
+        injected[transfer.target] = injected.get(transfer.target, 0.0) + delivered
+
+    # 按 samples 声明顺序遍历，首支超限管的报告与数组顺序无关
+    for tid, tube in tubes.items():
+        if tube.max_volume is None:
+            continue
+        net_volume = start_volume[tid] - aspirated.get(tid, 0.0) + injected.get(tid, 0.0)
+        if net_volume <= tube.max_volume + ZERO_EPS:
+            continue
+
+        # 定位首个向该超限管注入的操作
+        offending_offset = next(
+            offset
+            for offset, transfer in enumerate(batch)
+            if transfer.target == tid
+        )
+        index = start_index + offending_offset
+        delivered = _effective_delivered(batch[offending_offset])
+        if mode == "time_batch" and batch_size > 1:
+            message = (
+                f"transfers[{index}] 使批次（batch 起始于 "
+                f"transfers[{start_index}]，共 {batch_size} 个同时刻操作）"
+                f"向 {tid!r} 的累计实际注入（delivered_amount）达到 "
+                f"{_clean(injected[tid])}，扣除同批吸出 {_clean(aspirated.get(tid, 0.0))} 后"
+                f"该管批末净体积为 {_clean(net_volume)}，超过管容量 "
+                f"{_clean(tube.max_volume)}（批次开始时体积 "
+                f"{_clean(start_volume[tid])}）"
+            )
+        else:
+            message = (
+                f"transfers[{index}] 向 {tid!r} 实际注入 {_clean(delivered)}，"
+                f"注入后该管体积为 {_clean(net_volume)}，超过管容量 "
+                f"{_clean(tube.max_volume)}（注入前为 {_clean(start_volume[tid])}）"
+            )
+        return _build_error(
+            "TUBE_OVER_CAPACITY",
+            message,
+            index,
+            f"transfers[{index}].delivered_amount",
+        )
     return None
 
 
@@ -459,6 +550,7 @@ def run_simulation(request: SimulationRequest) -> dict:
                 for name in all_markers
             },
             origins={sample.id: sample.initial_volume},
+            max_volume=sample.max_volume,
         )
 
     initial_states = [_snapshot(tubes[s.id], all_markers) for s in samples]
@@ -516,6 +608,15 @@ def run_simulation(request: SimulationRequest) -> dict:
         )
         if volume_error is not None:
             error = volume_error
+            break
+
+        # 管容量校验：sequential 每步按实际注入后校验目标管；
+        # time_batch 以批次开始状态汇总吸出 / 注入，按批末净体积统一校验
+        capacity_error = _validate_batch_capacity(
+            batch, position, tubes, len(batch), request.execution_mode
+        )
+        if capacity_error is not None:
+            error = capacity_error
             break
 
         # 校验全部通过：原子落地整批
